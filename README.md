@@ -6,8 +6,13 @@
 This is a tiny, auditable script that you can throw on your server to issue
 and renew [Let's Encrypt](https://letsencrypt.org/) certificates. Since it has
 to be run on your server and have access to your private Let's Encrypt account
-key, I tried to make it as tiny as possible (currently less than 200 lines).
-The only prerequisites are python and openssl.
+key, I tried to make it as tiny as possible (currently less than 250 lines).
+The only prerequisites are python, boto3, and openssl.
+
+It supports http-01 and dns-01 challenges. The default is dns-01 so that it
+can easily be used with the [debops](https://docs.debops.org/en/master/) pki
+role. The dns-01 challenge only supports AWS Route53 hosted zones using the
+boto3 python library.
 
 **PLEASE READ THE SOURCE CODE! YOU MUST TRUST IT WITH YOUR PRIVATE ACCOUNT KEY!**
 

@@ -1,19 +1,24 @@
 #!/usr/bin/env python
 # Copyright Daniel Roesler, under MIT license, see LICENSE at github.com/diafygi/acme-tiny
+#   Modified by Jonathan Struebel to add DNS-01 against AWS Route53
 import argparse, subprocess, json, os, sys, base64, binascii, time, hashlib, re, copy, textwrap, logging
 try:
     from urllib.request import urlopen, Request # Python 3
 except ImportError:
     from urllib2 import urlopen, Request # Python 2
 
+# Use Boto3 for AWS access
+import boto3
+
 DEFAULT_CA = "https://acme-v02.api.letsencrypt.org" # DEPRECATED! USE DEFAULT_DIRECTORY_URL INSTEAD
 DEFAULT_DIRECTORY_URL = "https://acme-v02.api.letsencrypt.org/directory"
+DEFAULT_CHALLENGE_TYPE = "dns-01"
 
 LOGGER = logging.getLogger(__name__)
 LOGGER.addHandler(logging.StreamHandler())
 LOGGER.setLevel(logging.INFO)
 
-def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA, disable_check=False, directory_url=DEFAULT_DIRECTORY_URL, contact=None):
+def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA, disable_check=False, directory_url=DEFAULT_DIRECTORY_URL, contact=None, challenge_type=DEFAULT_CHALLENGE_TYPE):
     directory, acct_headers, alg, jwk = None, None, None, None # global variables
 
     # helper functions - base64 encode for jose spec
@@ -69,6 +74,35 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA, disable_check
             time.sleep(0 if result is None else 2)
             result, _, _ = _send_signed_request(url, None, err_msg)
         return result
+
+    # helper function - determin AWS domain ID
+    def _determine_aws_domain(client, domain):
+        if not domain.endswith('.'):
+            domain = domain + '.'
+        # use paginator to iterate over all hosted zones
+        paginator = client.get_paginator('list_hosted_zones')
+        # https://github.com/boto/botocore/issues/1535 result_key_iters is undocumented
+        for page in paginator.paginate().result_key_iters():
+            for result in page:
+                if result['Name'] in domain: return result['Id']
+
+    # helper function - create txt record
+    def _create_txt_record(client, domain, name, data):
+        zone_id = _determine_aws_domain(client, domain)
+        if not zone_id:
+            raise Exception('Hosted zone for domain {0} not found'.format(domain))
+        response = client.change_resource_record_sets( HostedZoneId=zone_id, ChangeBatch={ 'Changes': [ { 'Action': 'UPSERT', 'ResourceRecordSet': { 'Name': name, 'Type': 'TXT', 'TTL': 60, 'ResourceRecords': [ { 'Value': '"{0}"'.format(data) } ] } } ] })
+        waiter = client.get_waiter('resource_record_sets_changed')
+        waiter.wait(Id=response['ChangeInfo']['Id'])
+        return {'name': name, 'data': data}
+
+    # helper function - remove txt record
+    def _delete_txt_record(client, domain, record):
+        zone_id = _determine_aws_domain(client, domain)
+        client.change_resource_record_sets( HostedZoneId=zone_id, ChangeBatch={ 'Changes': [ { 'Action': 'DELETE', 'ResourceRecordSet': { 'Name': record['name'], 'Type': 'TXT', 'TTL': 60, 'ResourceRecords': [ { 'Value': '"{0}"'.format(record['data']) } ] } } ] })
+
+    if challenge_type == 'dns-01':
+        aws_client = boto3.client('route53')
 
     # parse account key to get public key
     log.info("Parsing account key...")
@@ -128,26 +162,41 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA, disable_check
         log.info("Verifying {0}...".format(domain))
 
         # find the http-01 challenge and write the challenge file
-        challenge = [c for c in authorization['challenges'] if c['type'] == "http-01"][0]
+        challenge = [c for c in authorization['challenges'] if c['type'] == challenge_type][0]
         token = re.sub(r"[^A-Za-z0-9_\-]", "_", challenge['token'])
         keyauthorization = "{0}.{1}".format(token, thumbprint)
-        wellknown_path = os.path.join(acme_dir, token)
-        with open(wellknown_path, "w") as wellknown_file:
-            wellknown_file.write(keyauthorization)
+        if challenge_type == 'http-01':
+            wellknown_path = os.path.join(acme_dir, token)
+            with open(wellknown_path, "w") as wellknown_file:
+                wellknown_file.write(keyauthorization)
 
-        # check that the file is in place
-        try:
-            wellknown_url = "http://{0}/.well-known/acme-challenge/{1}".format(domain, token)
-            assert (disable_check or _do_request(wellknown_url)[0] == keyauthorization)
-        except (AssertionError, ValueError) as e:
-            raise ValueError("Wrote file to {0}, but couldn't download {1}: {2}".format(wellknown_path, wellknown_url, e))
+            # check that the file is in place
+            try:
+                wellknown_url = "http://{0}/.well-known/acme-challenge/{1}".format(domain, token)
+                assert (disable_check or _do_request(wellknown_url)[0] == keyauthorization)
+            except (AssertionError, ValueError) as e:
+                raise ValueError("Wrote file to {0}, but couldn't download {1}: {2}".format(wellknown_path, wellknown_url, e))
+            payload = {}
+        elif challenge_type == 'dns-01':
+            txt_record = _b64(hashlib.sha256(keyauthorization.encode('utf8')).digest())
+          
+            # try to set DNS txt record for domain
+            try:
+                dns_record = '_acme-challenge.{0}.'.format(domain.lstrip('*.').rstrip('.'))
+                record = _create_txt_record(aws_client, domain, dns_record, txt_record)
+            except Exception as e:
+                raise ValueError("Error setting {0} as txt record to {1}: {2}".format(txt_record, dns_record, e))
+            payload = {"keyAuthorization": keyauthorization}
 
         # say the challenge is done
-        _send_signed_request(challenge['url'], {}, "Error submitting challenges: {0}".format(domain))
+        _send_signed_request(challenge['url'], payload, "Error submitting challenges: {0}".format(domain))
         authorization = _poll_until_not(auth_url, ["pending"], "Error checking challenge status for {0}".format(domain))
         if authorization['status'] != "valid":
             raise ValueError("Challenge did not pass for {0}: {1}".format(domain, authorization))
-        os.remove(wellknown_path)
+        if challenge_type == 'http-01':
+            os.remove(wellknown_path)
+        elif challenge_type == 'dns-01':
+            _delete_txt_record(aws_client, domain, record)
         log.info("{0} verified!".format(domain))
 
     # finalize the order with the csr
@@ -188,10 +237,11 @@ def main(argv=None):
     parser.add_argument("--directory-url", default=DEFAULT_DIRECTORY_URL, help="certificate authority directory url, default is Let's Encrypt")
     parser.add_argument("--ca", default=DEFAULT_CA, help="DEPRECATED! USE --directory-url INSTEAD!")
     parser.add_argument("--contact", metavar="CONTACT", default=None, nargs="*", help="Contact details (e.g. mailto:aaa@bbb.com) for your account-key")
+    parser.add_argument("--challenge-type", default=DEFAULT_CHALLENGE_TYPE, help="challenge type to use, dns-01 or http-01, defaults to dns-01")
 
     args = parser.parse_args(argv)
     LOGGER.setLevel(args.quiet or LOGGER.level)
-    signed_crt = get_crt(args.account_key, args.csr, args.acme_dir, log=LOGGER, CA=args.ca, disable_check=args.disable_check, directory_url=args.directory_url, contact=args.contact)
+    signed_crt = get_crt(args.account_key, args.csr, args.acme_dir, log=LOGGER, CA=args.ca, disable_check=args.disable_check, directory_url=args.directory_url, contact=args.contact, challenge_type=args.challenge_type)
     sys.stdout.write(signed_crt)
 
 if __name__ == "__main__": # pragma: no cover
